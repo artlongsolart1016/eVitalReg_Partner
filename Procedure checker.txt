@@ -1,0 +1,935 @@
+USE [LCRDbase_Online]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_CheckBirthDuplicates_FAST]    Script Date: 02/23/2026 4:13:57 pm ******/
+DROP PROCEDURE [dbo].[sp_CheckBirthDuplicates_FAST]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_CheckBirthDuplicates_FAST]    Script Date: 02/23/2026 4:13:57 pm ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+CREATE PROCEDURE [dbo].[sp_CheckBirthDuplicates_FAST]
+    @BatchSize INT = 500,
+    @Debug BIT = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+
+    DECLARE @StartTime DATETIME2 = GETDATE();
+    DECLARE @ProcessedCount INT = 0;
+    DECLARE @MatchesFound INT = 0;
+
+    DECLARE @OnlineRecords TABLE (
+        RegistryNum NVARCHAR(50) PRIMARY KEY,
+        CFirstName NVARCHAR(100), CLastName NVARCHAR(100), CBirthDate DATE,
+        MFirstName NVARCHAR(100), MLastName NVARCHAR(100),
+        FFirstName NVARCHAR(100), FLastName NVARCHAR(100)
+    );
+
+    -- Load batch of unchecked records
+    INSERT INTO @OnlineRecords
+    SELECT TOP(@BatchSize)
+        RegistryNum,
+        UPPER(LTRIM(RTRIM(ISNULL(CFirstName,'')))),
+        UPPER(LTRIM(RTRIM(ISNULL(CLastName,'')))),
+        TRY_CONVERT(DATE, CBirthDate),
+        UPPER(LTRIM(RTRIM(ISNULL(MFirstName,'')))),
+        UPPER(LTRIM(RTRIM(ISNULL(MLastName,'')))),
+        UPPER(LTRIM(RTRIM(ISNULL(FFirstName,'')))),
+        UPPER(LTRIM(RTRIM(ISNULL(FLastName,''))))
+    FROM Online_birthdocument
+    WHERE ISNULL(LTRIM(RTRIM(DuplicateCheck)),'') IN ('','0','N');
+
+    SET @ProcessedCount = @@ROWCOUNT;
+    IF @ProcessedCount = 0
+    BEGIN
+        SELECT 0 AS RecordsChecked, 0 AS MatchesFound, 0.0 AS ElapsedSeconds;
+        RETURN;
+    END
+
+    DECLARE @Matches TABLE (
+        MatchRegistryNum NVARCHAR(50),
+        Match_X_RegistryNum NVARCHAR(50),
+        ChildScore DECIMAL(5,2),
+        MotherScore DECIMAL(5,2),
+        FatherScore DECIMAL(5,2),
+        BirthDateScore DECIMAL(5,2),
+        MatchPercent DECIMAL(5,2),
+        PRIMARY KEY (MatchRegistryNum, Match_X_RegistryNum)
+    );
+
+    -- Exact matching (child + birthdate)
+    INSERT INTO @Matches
+    SELECT
+        o.RegistryNum,
+        p.RegistryNum,
+        CASE WHEN o.CFirstName = p.CFirstName AND o.CLastName = p.CLastName THEN 100 ELSE 0 END,
+        CASE WHEN o.MFirstName = p.MFirstName AND o.MLastName = p.MLastName THEN 100 ELSE 0 END,
+        CASE WHEN o.FFirstName = p.FFirstName AND o.FLastName = p.FLastName THEN 100 ELSE 0 END,
+        CASE WHEN o.CBirthDate = p.CBirthDate THEN 100 ELSE 0 END,
+        (
+            CASE WHEN o.CFirstName = p.CFirstName AND o.CLastName = p.CLastName THEN 100 ELSE 0 END * 0.5 +
+            CASE WHEN o.MFirstName = p.MFirstName AND o.MLastName = p.MLastName THEN 100 ELSE 0 END * 0.2 +
+            CASE WHEN o.FFirstName = p.FFirstName AND o.FLastName = p.FLastName THEN 100 ELSE 0 END * 0.2 +
+            CASE WHEN o.CBirthDate = p.CBirthDate THEN 100 ELSE 0 END * 0.1
+        )
+    FROM @OnlineRecords o
+    INNER JOIN LCRImaging_Birth.dbo.Philcris_Birth_All p WITH (NOLOCK)
+        ON o.CLastName = p.CLastName
+        AND TRY_CONVERT(DATE, p.CBirthDate) = o.CBirthDate;
+
+    -- Save exact matches
+    INSERT INTO online_birthdocument_match (
+        MatchRegistryNum, Match_X_RegistryNum,
+        Match_ChildFName, Match_ChildLName, CBirthDate,
+        Match_MotherFName, Match_MotherLName,
+        Match_FatherFName, Match_FatherLName,
+        ChildIdentityScore, MaternalIdentityScore, PaternalIdentityScore,
+        BirthdateMatch, MatchPercent, DateMatched
+    )
+    SELECT
+        m.MatchRegistryNum, m.Match_X_RegistryNum,
+        p.CFirstName, p.CLastName, p.CBirthDate,
+        p.MFirstName, p.MLastName,
+        p.FFirstName, p.FLastName,
+        m.ChildScore, m.MotherScore, m.FatherScore,
+        m.BirthDateScore, m.MatchPercent, GETDATE()
+    FROM @Matches m
+    INNER JOIN LCRImaging_Birth.dbo.Philcris_Birth_All p
+        ON m.Match_X_RegistryNum = p.RegistryNum
+    WHERE m.MatchPercent >= 80.0;
+
+    SET @MatchesFound = @@ROWCOUNT;
+
+    -- Update records with matches
+    UPDATE o
+    SET DuplicateCheck = 'Y', CheckStatus = CAST(ISNULL(m.MaxMatch,0) AS NVARCHAR(10))
+    FROM Online_birthdocument o
+    INNER JOIN (
+        SELECT MatchRegistryNum, MAX(MatchPercent) AS MaxMatch
+        FROM @Matches
+        GROUP BY MatchRegistryNum
+    ) m ON o.RegistryNum = m.MatchRegistryNum;
+
+    -- Mark remaining as PENDING
+    UPDATE o
+    SET DuplicateCheck = 'PENDING', CheckStatus = '0'
+    FROM Online_birthdocument o
+    INNER JOIN @OnlineRecords r ON o.RegistryNum = r.RegistryNum
+    WHERE NOT EXISTS (
+        SELECT 1 FROM @Matches m WHERE m.MatchRegistryNum = r.RegistryNum
+    );
+
+    DECLARE @ElapsedSeconds DECIMAL(10,2) = DATEDIFF(MILLISECOND, @StartTime, GETDATE()) / 1000.0;
+
+    SELECT @ProcessedCount AS RecordsChecked, @MatchesFound AS MatchesFound, @ElapsedSeconds AS ElapsedSeconds;
+END
+GO
+
+USE [LCRDbase_Online]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_CheckBirthDuplicates_LEVENSHTEIN]    Script Date: 02/23/2026 4:14:23 pm ******/
+DROP PROCEDURE [dbo].[sp_CheckBirthDuplicates_LEVENSHTEIN]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_CheckBirthDuplicates_LEVENSHTEIN]    Script Date: 02/23/2026 4:14:23 pm ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+CREATE PROCEDURE [dbo].[sp_CheckBirthDuplicates_LEVENSHTEIN]
+    @BatchSize INT = 500,
+    @MinSimilarity DECIMAL(5,2) = 80.0,
+    @Debug BIT = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+
+    DECLARE @StartTime DATETIME2 = GETDATE();
+    DECLARE @ProcessedCount INT = 0;
+    DECLARE @MatchesFound INT = 0;
+
+    DECLARE @OnlineRecords TABLE (
+        RegistryNum NVARCHAR(50) PRIMARY KEY,
+        CFirstName NVARCHAR(100), CMiddleName NVARCHAR(100), CLastName NVARCHAR(100), CBirthDate DATE,
+        MFirstName NVARCHAR(100), MMiddleName NVARCHAR(100), MLastName NVARCHAR(100),
+        FFirstName NVARCHAR(100), FMiddleName NVARCHAR(100), FLastName NVARCHAR(100)
+    );
+
+    -- Load pending records
+    INSERT INTO @OnlineRecords
+    SELECT TOP(@BatchSize)
+        RegistryNum,
+        CFirstName, CMiddleName, CLastName, CBirthDate,
+        MFirstName, MMiddleName, MLastName,
+        FFirstName, FMiddleName, FLastName
+    FROM Online_birthdocument
+    WHERE DuplicateCheck = 'PENDING';
+
+    SET @ProcessedCount = @@ROWCOUNT;
+    IF @ProcessedCount = 0
+    BEGIN
+        SELECT 0 AS RecordsChecked, 0 AS MatchesFound, 0.0 AS ElapsedSeconds, @MinSimilarity AS MinThreshold;
+        RETURN;
+    END
+
+    DECLARE @Matches TABLE (
+        MatchRegistryNum NVARCHAR(50),
+        Match_X_RegistryNum NVARCHAR(50),
+        ChildScore DECIMAL(5,2),
+        MotherScore DECIMAL(5,2),
+        FatherScore DECIMAL(5,2),
+        BirthDateScore DECIMAL(5,2),
+        MatchPercent DECIMAL(5,2),
+        PRIMARY KEY (MatchRegistryNum, Match_X_RegistryNum)
+    );
+
+    -- Fuzzy matching
+    INSERT INTO @Matches
+    SELECT 
+        o.RegistryNum,
+        p.RegistryNum,
+        dbo.fn_NameSimilarity(o.CFirstName,o.CMiddleName,o.CLastName,p.CFirstName,p.CMiddleName,p.CLastName),
+        dbo.fn_NameSimilarity(o.MFirstName,o.MMiddleName,o.MLastName,p.MFirstName,p.MMiddleName,p.MLastName),
+        dbo.fn_NameSimilarity(o.FFirstName,o.FMiddleName,o.FLastName,p.FFirstName,p.FMiddleName,p.FLastName),
+        CASE WHEN o.CBirthDate = p.CBirthDate THEN 100 ELSE 0 END,
+        (
+            dbo.fn_NameSimilarity(o.CFirstName,o.CMiddleName,o.CLastName,p.CFirstName,p.CMiddleName,p.CLastName) * 0.5 +
+            dbo.fn_NameSimilarity(o.MFirstName,o.MMiddleName,o.MLastName,p.MFirstName,p.MMiddleName,p.MLastName) * 0.2 +
+            dbo.fn_NameSimilarity(o.FFirstName,o.FMiddleName,o.FLastName,p.FFirstName,p.FMiddleName,p.FLastName) * 0.2 +
+            CASE WHEN o.CBirthDate = p.CBirthDate THEN 100 ELSE 0 END * 0.1
+        )
+    FROM @OnlineRecords o
+    CROSS APPLY (
+        SELECT TOP 100 *
+        FROM LCRImaging_Birth.dbo.Philcris_Birth_All p WITH (NOLOCK)
+        WHERE p.CLastName = o.CLastName
+        ORDER BY CASE WHEN p.CBirthDate = o.CBirthDate THEN 0 ELSE 1 END
+    ) p
+    WHERE o.CLastName <> ''
+      AND (
+          dbo.fn_NameSimilarity(o.CFirstName,o.CMiddleName,o.CLastName,p.CFirstName,p.CMiddleName,p.CLastName) >= @MinSimilarity
+          OR dbo.fn_NameSimilarity(o.MFirstName,o.MMiddleName,o.MLastName,p.MFirstName,p.MMiddleName,p.MLastName) >= @MinSimilarity
+          OR dbo.fn_NameSimilarity(o.FFirstName,o.FMiddleName,o.FLastName,p.FFirstName,p.FMiddleName,p.FLastName) >= @MinSimilarity
+      );
+
+    -- Save fuzzy matches
+    INSERT INTO online_birthdocument_match (
+        MatchRegistryNum, Match_X_RegistryNum,
+        Match_ChildFName, Match_ChildMName, Match_ChildLName, CBirthDate,
+        Match_MotherFName, Match_MotherMName, Match_MotherLName,
+        Match_FatherFName, Match_FatherMName, Match_FatherLName,
+        ChildIdentityScore, MaternalIdentityScore, PaternalIdentityScore,
+        BirthdateMatch, MatchPercent, DateMatched
+    )
+    SELECT
+        m.MatchRegistryNum,
+        m.Match_X_RegistryNum,
+        p.CFirstName, p.CMiddleName, p.CLastName, p.CBirthDate,
+        p.MFirstName, p.MMiddleName, p.MLastName,
+        p.FFirstName, p.FMiddleName, p.FLastName,
+        m.ChildScore, m.MotherScore, m.FatherScore,
+        CASE WHEN m.BirthDateScore = 100 THEN 'Exact' ELSE 'None' END,
+        m.MatchPercent,
+        GETDATE()
+    FROM @Matches m
+    INNER JOIN LCRImaging_Birth.dbo.Philcris_Birth_All p
+        ON m.Match_X_RegistryNum = p.RegistryNum
+    WHERE m.MatchPercent >= @MinSimilarity;
+
+    SET @MatchesFound = @@ROWCOUNT;
+
+    -- Update PENDING records with fuzzy results
+    UPDATE o
+    SET DuplicateCheck = 'Y', CheckStatus = CAST(ISNULL(m.MaxMatch,0) AS NVARCHAR(10))
+    FROM Online_birthdocument o
+    INNER JOIN (
+        SELECT MatchRegistryNum, MAX(MatchPercent) AS MaxMatch
+        FROM @Matches
+        GROUP BY MatchRegistryNum
+    ) m ON o.RegistryNum = m.MatchRegistryNum;
+
+    -- Remaining PENDING records
+    UPDATE o
+    SET DuplicateCheck = 'Y', CheckStatus = '0'
+    FROM Online_birthdocument o
+    INNER JOIN @OnlineRecords r ON o.RegistryNum = r.RegistryNum
+    WHERE NOT EXISTS (
+        SELECT 1 FROM @Matches m WHERE m.MatchRegistryNum = r.RegistryNum
+    );
+
+    DECLARE @ElapsedSeconds DECIMAL(10,2) = DATEDIFF(MILLISECOND, @StartTime, GETDATE()) / 1000.0;
+
+    SELECT @ProcessedCount AS RecordsChecked,
+           @MatchesFound AS MatchesFound,
+           @ElapsedSeconds AS ElapsedSeconds,
+           @MinSimilarity AS MinThreshold;
+END
+GO
+
+
+USE [LCRDbase_Online]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_CheckDeathDuplicates_FAST]    Script Date: 02/23/2026 4:14:35 pm ******/
+DROP PROCEDURE [dbo].[sp_CheckDeathDuplicates_FAST]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_CheckDeathDuplicates_FAST]    Script Date: 02/23/2026 4:14:35 pm ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+CREATE PROCEDURE [dbo].[sp_CheckDeathDuplicates_FAST]
+    @BatchSize INT = 100,
+    @Debug BIT = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+
+    DECLARE @StartTime DATETIME2 = GETDATE();
+    DECLARE @ProcessedCount INT = 0;
+    DECLARE @MatchesFound INT = 0;
+
+    DECLARE @OnlineRecords TABLE (
+        RegistryNum NVARCHAR(50) PRIMARY KEY,
+        CFirstName NVARCHAR(100), CMiddleName NVARCHAR(100), CLastName NVARCHAR(100),
+        CBirthDate DATE, CDeathDate DATE, CSexId NVARCHAR(10)
+    );
+
+    -- ✅ Get unchecked records (NULL or empty)
+    INSERT INTO @OnlineRecords
+    SELECT TOP (@BatchSize)
+        RegistryNum,
+        UPPER(LTRIM(RTRIM(ISNULL(CFirstName,'')))),
+        UPPER(LTRIM(RTRIM(ISNULL(CMiddleName,'')))),
+        UPPER(LTRIM(RTRIM(ISNULL(CLastName,'')))),
+        TRY_CONVERT(DATE, CBirthDate),
+        TRY_CONVERT(DATE, CDeathDate),
+        UPPER(LTRIM(RTRIM(ISNULL(CSexId,''))))
+    FROM Online_deathdocument
+    WHERE (DuplicateCheck IS NULL OR LTRIM(RTRIM(DuplicateCheck)) IN ('', '0', 'N'))
+      AND RegistryNum IS NOT NULL 
+      AND LTRIM(RTRIM(RegistryNum)) <> '';
+
+    SET @ProcessedCount = @@ROWCOUNT;
+
+    IF @ProcessedCount = 0
+    BEGIN
+        SELECT 0 AS RecordsChecked, 0 AS MatchesFound, 0.0 AS ElapsedSeconds, 0.0 AS RecordsPerSecond;
+        RETURN;
+    END
+
+    DECLARE @Matches TABLE (
+        MatchRegistryNum NVARCHAR(50),
+        Match_X_RegistryNum NVARCHAR(50),
+        DeceasedNameScore DECIMAL(5,2),
+        BirthDateScore DECIMAL(5,2),
+        DeathDateScore DECIMAL(5,2),
+        SexScore DECIMAL(5,2),
+        MatchPercent DECIMAL(5,2),
+        PRIMARY KEY (MatchRegistryNum, Match_X_RegistryNum)
+    );
+
+    -- EXACT matching
+    INSERT INTO @Matches
+    SELECT
+        o.RegistryNum,
+        p.RegistryNum,
+        CASE 
+            WHEN o.CFirstName = p.CFirstName AND o.CLastName = p.CLastName THEN 100.0
+            WHEN o.CLastName = p.CLastName THEN 80.0
+            ELSE 60.0
+        END AS DeceasedNameScore,
+        CASE 
+            WHEN o.CBirthDate IS NOT NULL AND p.CBirthDate IS NOT NULL AND o.CBirthDate = p.CBirthDate THEN 100.0
+            WHEN o.CBirthDate IS NOT NULL AND p.CBirthDate IS NOT NULL AND ABS(DATEDIFF(DAY,o.CBirthDate,p.CBirthDate)) <= 3 THEN 80.0
+            ELSE 60.0
+        END AS BirthDateScore,
+        CASE
+            WHEN o.CDeathDate IS NOT NULL AND p.CDeathDate IS NOT NULL AND o.CDeathDate = p.CDeathDate THEN 100.0
+            WHEN o.CDeathDate IS NOT NULL AND p.CDeathDate IS NOT NULL AND ABS(DATEDIFF(DAY,o.CDeathDate,p.CDeathDate)) <= 3 THEN 80.0
+            ELSE 60.0
+        END AS DeathDateScore,
+        CASE WHEN o.CSexId = p.CSexId THEN 100.0 ELSE 0.0 END AS SexScore,
+        (
+            CASE 
+                WHEN o.CFirstName = p.CFirstName AND o.CLastName = p.CLastName THEN 100.0
+                WHEN o.CLastName = p.CLastName THEN 80.0
+                ELSE 60.0
+            END * 0.6
+            + CASE 
+                WHEN o.CBirthDate IS NOT NULL AND p.CBirthDate IS NOT NULL AND o.CBirthDate = p.CBirthDate THEN 100.0
+                WHEN o.CBirthDate IS NOT NULL AND p.CBirthDate IS NOT NULL AND ABS(DATEDIFF(DAY,o.CBirthDate,p.CBirthDate)) <= 3 THEN 80.0
+                ELSE 60.0
+              END * 0.2
+            + CASE 
+                WHEN o.CDeathDate IS NOT NULL AND p.CDeathDate IS NOT NULL AND o.CDeathDate = p.CDeathDate THEN 100.0
+                WHEN o.CDeathDate IS NOT NULL AND p.CDeathDate IS NOT NULL AND ABS(DATEDIFF(DAY,o.CDeathDate,p.CDeathDate)) <= 3 THEN 80.0
+                ELSE 60.0
+              END * 0.15
+            + CASE WHEN o.CSexId = p.CSexId THEN 100.0 ELSE 0.0 END * 0.05
+        ) AS MatchPercent
+    FROM @OnlineRecords o
+    CROSS APPLY (
+        SELECT TOP 100 * 
+        FROM LCRImaging_Death.dbo.Philcris_Death_All WITH (NOLOCK)
+        WHERE CLastName = o.CLastName  -- ✅ Exact last name only
+        ORDER BY CASE WHEN CDeathDate = o.CDeathDate THEN 0 ELSE 1 END
+    ) p
+    WHERE o.CLastName <> '';
+
+    -- Save matches (≥80%)
+    INSERT INTO online_deathdocument_match(
+        MatchRegistryNum, Match_X_RegistryNum,
+        Match_FName, Match_MName, Match_LName,
+        CDeathDate, CBirthDate,
+        DeceasedIdentityScore, BirthDateScore, DeathDateScore, SexScore,
+        MatchPercent, DateMatched
+    )
+    SELECT
+        m.MatchRegistryNum, m.Match_X_RegistryNum,
+        UPPER(p.CFirstName), UPPER(p.CMiddleName), UPPER(p.CLastName),
+        p.CDeathDate, p.CBirthDate,
+        m.DeceasedNameScore, m.BirthDateScore, m.DeathDateScore, m.SexScore,
+        m.MatchPercent, GETDATE()
+    FROM @Matches m
+    INNER JOIN LCRImaging_Death.dbo.Philcris_Death_All p WITH (NOLOCK) 
+        ON m.Match_X_RegistryNum = p.RegistryNum
+    WHERE m.MatchPercent >= 80.0;
+
+    SET @MatchesFound = @@ROWCOUNT;
+
+    -- ✅ TWO-STATE UPDATE: EXACT matches vs PENDING
+    UPDATE o
+    SET o.DuplicateCheck = 'Y', o.CheckStatus = CAST(ISNULL(m.MaxMatch,0) AS NVARCHAR(10))
+    FROM Online_deathdocument o
+    INNER JOIN (
+        SELECT MatchRegistryNum, MAX(MatchPercent) AS MaxMatch 
+        FROM @Matches 
+        WHERE MatchPercent >= 80.0 
+        GROUP BY MatchRegistryNum
+    ) m ON o.RegistryNum = m.MatchRegistryNum;
+
+    -- ✅ Mark non-matches as PENDING
+    UPDATE o
+    SET o.DuplicateCheck = 'PENDING', o.CheckStatus = '0'
+    FROM Online_deathdocument o
+    INNER JOIN @OnlineRecords r ON o.RegistryNum = r.RegistryNum
+    WHERE NOT EXISTS (
+        SELECT 1 FROM @Matches m 
+        WHERE m.MatchRegistryNum = r.RegistryNum 
+        AND m.MatchPercent >= 80.0
+    );
+
+    DECLARE @ElapsedSeconds DECIMAL(10,2) = DATEDIFF(MILLISECOND, @StartTime, GETDATE()) / 1000.0;
+
+    SELECT @ProcessedCount AS RecordsChecked, @MatchesFound AS MatchesFound,
+           @ElapsedSeconds AS ElapsedSeconds,
+           CASE WHEN @ElapsedSeconds > 0 THEN CAST(@ProcessedCount/@ElapsedSeconds AS DECIMAL(10,2)) ELSE 0.0 END AS RecordsPerSecond;
+END
+
+GO
+
+
+USE [LCRDbase_Online]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_CheckDeathDuplicates_LEVENSHTEIN]    Script Date: 02/23/2026 4:14:45 pm ******/
+DROP PROCEDURE [dbo].[sp_CheckDeathDuplicates_LEVENSHTEIN]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_CheckDeathDuplicates_LEVENSHTEIN]    Script Date: 02/23/2026 4:14:45 pm ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+CREATE PROCEDURE [dbo].[sp_CheckDeathDuplicates_LEVENSHTEIN]
+    @BatchSize INT = 100,
+    @MinSimilarity DECIMAL(5,2) = 80.0,
+    @Debug BIT = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+
+    DECLARE @StartTime DATETIME2 = GETDATE();
+    DECLARE @ProcessedCount INT = 0;
+    DECLARE @MatchesFound INT = 0;
+
+    DECLARE @OnlineRecords TABLE (
+        RegistryNum NVARCHAR(50) PRIMARY KEY,
+        CFirstName NVARCHAR(100), CMiddleName NVARCHAR(100), CLastName NVARCHAR(100),
+        CBirthDate DATE, CDeathDate DATE, CSexId NVARCHAR(10)
+    );
+
+    -- ✅ ONLY PROCESS PENDING RECORDS
+    INSERT INTO @OnlineRecords
+    SELECT TOP (@BatchSize)
+        RegistryNum,
+        UPPER(LTRIM(RTRIM(ISNULL(CFirstName,'')))),
+        UPPER(LTRIM(RTRIM(ISNULL(CMiddleName,'')))),
+        UPPER(LTRIM(RTRIM(ISNULL(CLastName,'')))),
+        TRY_CONVERT(DATE, CBirthDate),
+        TRY_CONVERT(DATE, CDeathDate),
+        UPPER(LTRIM(RTRIM(ISNULL(CSexId,''))))
+    FROM Online_deathdocument
+    WHERE DuplicateCheck = 'PENDING'  -- ✅ Only PENDING
+      AND RegistryNum IS NOT NULL 
+      AND LTRIM(RTRIM(RegistryNum)) <> '';
+
+    SET @ProcessedCount = @@ROWCOUNT;
+
+    IF @ProcessedCount = 0
+    BEGIN
+        SELECT 0 AS RecordsChecked, 0 AS MatchesFound, 0.0 AS ElapsedSeconds, 0.0 AS RecordsPerSecond, @MinSimilarity AS MinThreshold;
+        RETURN;
+    END
+
+    DECLARE @Matches TABLE (
+        MatchRegistryNum NVARCHAR(50),
+        Match_X_RegistryNum NVARCHAR(50),
+        DeceasedNameSimilarity DECIMAL(5,2),
+        BirthDateScore DECIMAL(5,2),
+        DeathDateScore DECIMAL(5,2),
+        SexScore DECIMAL(5,2),
+        MatchPercent DECIMAL(5,2),
+        PRIMARY KEY (MatchRegistryNum, Match_X_RegistryNum)
+    );
+
+    -- Fuzzy matching (exact last name only for performance)
+    INSERT INTO @Matches
+    SELECT
+        o.RegistryNum,
+        p.RegistryNum,
+        dbo.fn_NameSimilarity(o.CFirstName,o.CMiddleName,o.CLastName,
+                              p.CFirstName,p.CMiddleName,p.CLastName) AS DeceasedNameSimilarity,
+        CASE 
+            WHEN o.CBirthDate IS NOT NULL AND p.CBirthDate IS NOT NULL AND o.CBirthDate = p.CBirthDate THEN 100.0
+            WHEN o.CBirthDate IS NOT NULL AND p.CBirthDate IS NOT NULL AND ABS(DATEDIFF(DAY,o.CBirthDate,p.CBirthDate)) <= 3 THEN 80.0
+            WHEN o.CBirthDate IS NOT NULL AND p.CBirthDate IS NOT NULL AND ABS(DATEDIFF(DAY,o.CBirthDate,p.CBirthDate)) <= 7 THEN 60.0
+            ELSE 0.0
+        END AS BirthDateScore,
+        CASE
+            WHEN o.CDeathDate IS NOT NULL AND p.CDeathDate IS NOT NULL AND o.CDeathDate = p.CDeathDate THEN 100.0
+            WHEN o.CDeathDate IS NOT NULL AND p.CDeathDate IS NOT NULL AND ABS(DATEDIFF(DAY,o.CDeathDate,p.CDeathDate)) <= 3 THEN 80.0
+            WHEN o.CDeathDate IS NOT NULL AND p.CDeathDate IS NOT NULL AND ABS(DATEDIFF(DAY,o.CDeathDate,p.CDeathDate)) <= 7 THEN 60.0
+            ELSE 0.0
+        END AS DeathDateScore,
+        CASE WHEN o.CSexId = p.CSexId THEN 100.0 ELSE 0.0 END AS SexScore,
+        (
+            dbo.fn_NameSimilarity(o.CFirstName,o.CMiddleName,o.CLastName,
+                                  p.CFirstName,p.CMiddleName,p.CLastName) * 0.6
+            + CASE 
+                WHEN o.CBirthDate IS NOT NULL AND p.CBirthDate IS NOT NULL AND o.CBirthDate = p.CBirthDate THEN 100.0
+                WHEN o.CBirthDate IS NOT NULL AND p.CBirthDate IS NOT NULL AND ABS(DATEDIFF(DAY,o.CBirthDate,p.CBirthDate)) <= 3 THEN 80.0
+                ELSE 60.0
+              END * 0.2
+            + CASE 
+                WHEN o.CDeathDate IS NOT NULL AND p.CDeathDate IS NOT NULL AND o.CDeathDate = p.CDeathDate THEN 100.0
+                WHEN o.CDeathDate IS NOT NULL AND p.CDeathDate IS NOT NULL AND ABS(DATEDIFF(DAY,o.CDeathDate,p.CDeathDate)) <= 3 THEN 80.0
+                ELSE 60.0
+              END * 0.15
+            + CASE WHEN o.CSexId = p.CSexId THEN 100.0 ELSE 0.0 END * 0.05
+        ) AS MatchPercent
+    FROM @OnlineRecords o
+    CROSS APPLY (
+        SELECT TOP 100 * 
+        FROM LCRImaging_Death.dbo.Philcris_Death_All WITH (NOLOCK)
+        WHERE CLastName = o.CLastName  -- ✅ Exact last name only
+        ORDER BY CASE WHEN CDeathDate = o.CDeathDate THEN 0 ELSE 1 END
+    ) p
+    WHERE o.CLastName <> '';
+
+    -- Save fuzzy matches
+    INSERT INTO online_deathdocument_match(
+        MatchRegistryNum, Match_X_RegistryNum,
+        Match_FName, Match_MName, Match_LName,
+        CDeathDate, CBirthDate,
+        DeceasedIdentityScore, BirthDateScore, DeathDateScore, SexScore,
+        MatchPercent, DateMatched
+    )
+    SELECT
+        m.MatchRegistryNum, m.Match_X_RegistryNum,
+        UPPER(p.CFirstName), UPPER(p.CMiddleName), UPPER(p.CLastName),
+        p.CDeathDate, p.CBirthDate,
+        m.DeceasedNameSimilarity, m.BirthDateScore, m.DeathDateScore, m.SexScore,
+        m.MatchPercent, GETDATE()
+    FROM @Matches m
+    INNER JOIN LCRImaging_Death.dbo.Philcris_Death_All p WITH (NOLOCK) 
+        ON m.Match_X_RegistryNum = p.RegistryNum
+    WHERE m.MatchPercent >= @MinSimilarity;
+
+    SET @MatchesFound = @@ROWCOUNT;
+
+    -- Update PENDING records with fuzzy results
+    UPDATE o
+    SET o.DuplicateCheck = 'Y', o.CheckStatus = CAST(ISNULL(m.MaxMatch,0) AS NVARCHAR(10))
+    FROM Online_deathdocument o
+    INNER JOIN (
+        SELECT MatchRegistryNum, MAX(MatchPercent) AS MaxMatch 
+        FROM @Matches 
+        GROUP BY MatchRegistryNum
+    ) m ON o.RegistryNum = m.MatchRegistryNum;
+
+    -- Mark remaining PENDING as checked (no fuzzy match)
+    UPDATE o
+    SET o.DuplicateCheck = 'Y', o.CheckStatus = '0'
+    FROM Online_deathdocument o
+    INNER JOIN @OnlineRecords r ON o.RegistryNum = r.RegistryNum
+    WHERE NOT EXISTS (SELECT 1 FROM @Matches m WHERE m.MatchRegistryNum = r.RegistryNum);
+
+    DECLARE @ElapsedSeconds DECIMAL(10,2) = DATEDIFF(MILLISECOND, @StartTime, GETDATE()) / 1000.0;
+
+    SELECT @ProcessedCount AS RecordsChecked, @MatchesFound AS MatchesFound,
+           @ElapsedSeconds AS ElapsedSeconds,
+           CASE WHEN @ElapsedSeconds > 0 THEN CAST(@ProcessedCount/@ElapsedSeconds AS DECIMAL(10,2)) ELSE 0.0 END AS RecordsPerSecond,
+           @MinSimilarity AS MinThreshold;
+END
+
+GO
+
+USE [LCRDbase_Online]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_CheckMarriageDuplicates_FAST]    Script Date: 02/23/2026 4:14:53 pm ******/
+DROP PROCEDURE [dbo].[sp_CheckMarriageDuplicates_FAST]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_CheckMarriageDuplicates_FAST]    Script Date: 02/23/2026 4:14:53 pm ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+CREATE PROCEDURE [dbo].[sp_CheckMarriageDuplicates_FAST]
+    @BatchSize INT = 100,
+    @Debug BIT = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+
+    DECLARE @StartTime DATETIME2 = GETDATE();
+    DECLARE @ProcessedCount INT = 0;
+    DECLARE @MatchesFound INT = 0;
+
+    DECLARE @OnlineRecords TABLE (
+        RegistryNum NVARCHAR(50) PRIMARY KEY,
+        HFirstName NVARCHAR(100), HMiddleName NVARCHAR(100), HLastName NVARCHAR(100), HBirthDate DATE,
+        WFirstName NVARCHAR(100), WMiddleName NVARCHAR(100), WLastName NVARCHAR(100), WBirthDate DATE,
+        MarriageDate DATE
+    );
+
+    -- ✅ Get unchecked records
+    INSERT INTO @OnlineRecords
+    SELECT TOP (@BatchSize)
+        RegistryNum,
+        UPPER(LTRIM(RTRIM(ISNULL(HFirstName,'')))),
+        UPPER(LTRIM(RTRIM(ISNULL(HMiddleName,'')))),
+        UPPER(LTRIM(RTRIM(ISNULL(HLastName,'')))),
+        TRY_CONVERT(DATE, HBirthDate),
+        UPPER(LTRIM(RTRIM(ISNULL(WFirstName,'')))),
+        UPPER(LTRIM(RTRIM(ISNULL(WMiddleName,'')))),
+        UPPER(LTRIM(RTRIM(ISNULL(WLastName,'')))),
+        TRY_CONVERT(DATE, WBirthDate),
+        TRY_CONVERT(DATE, MarriageDate)
+    FROM online_marriagedocument
+    WHERE (DuplicateCheck IS NULL OR LTRIM(RTRIM(DuplicateCheck)) IN ('','0','N'))
+      AND RegistryNum IS NOT NULL 
+      AND LTRIM(RTRIM(RegistryNum)) <> '';
+
+    SET @ProcessedCount = @@ROWCOUNT;
+
+    IF @ProcessedCount = 0
+    BEGIN
+        SELECT 0 AS RecordsChecked, 0 AS MatchesFound, 0.0 AS ElapsedSeconds, 0.0 AS RecordsPerSecond;
+        RETURN;
+    END
+
+    DECLARE @Matches TABLE (
+        MatchRegistryNum NVARCHAR(50),
+        Match_X_RegistryNum NVARCHAR(50),
+        GroomNameScore DECIMAL(5,2),
+        BrideNameScore DECIMAL(5,2),
+        MarriageDateScore DECIMAL(5,2),
+        MatchPercent DECIMAL(5,2),
+        PRIMARY KEY (MatchRegistryNum, Match_X_RegistryNum)
+    );
+
+    -- EXACT matching (groom + bride names, marriage date)
+    INSERT INTO @Matches
+    SELECT
+        o.RegistryNum,
+        p.RegistryNum,
+        CASE 
+            WHEN o.HFirstName = p.HFirstName AND o.HLastName = p.HLastName THEN 100.0
+            WHEN o.HLastName = p.HLastName THEN 85.0
+            ELSE 70.0
+        END AS GroomNameScore,
+        CASE 
+            WHEN o.WFirstName = p.WFirstName AND o.WLastName = p.WLastName THEN 100.0
+            WHEN o.WLastName = p.WLastName THEN 85.0
+            ELSE 70.0
+        END AS BrideNameScore,
+        CASE 
+            WHEN o.MarriageDate IS NOT NULL AND p.MarriageDate IS NOT NULL AND o.MarriageDate = p.MarriageDate THEN 100.0
+            WHEN o.MarriageDate IS NOT NULL AND p.MarriageDate IS NOT NULL AND ABS(DATEDIFF(DAY,o.MarriageDate,p.MarriageDate)) <= 3 THEN 80.0
+            ELSE 60.0
+        END AS MarriageDateScore,
+        (
+            CASE 
+                WHEN o.HFirstName = p.HFirstName AND o.HLastName = p.HLastName THEN 100.0
+                WHEN o.HLastName = p.HLastName THEN 85.0
+                ELSE 70.0
+            END * 0.4
+            + CASE 
+                WHEN o.WFirstName = p.WFirstName AND o.WLastName = p.WLastName THEN 100.0
+                WHEN o.WLastName = p.WLastName THEN 85.0
+                ELSE 70.0
+              END * 0.4
+            + CASE 
+                WHEN o.MarriageDate IS NOT NULL AND p.MarriageDate IS NOT NULL AND o.MarriageDate = p.MarriageDate THEN 100.0
+                WHEN o.MarriageDate IS NOT NULL AND p.MarriageDate IS NOT NULL AND ABS(DATEDIFF(DAY,o.MarriageDate,p.MarriageDate)) <= 3 THEN 80.0
+                ELSE 60.0
+              END * 0.2
+        ) AS MatchPercent
+    FROM @OnlineRecords o
+    CROSS APPLY (
+        SELECT TOP 100 * 
+        FROM LCRImaging_Marriage.dbo.Philcris_Marriage_All WITH (NOLOCK)
+        WHERE HLastName = o.HLastName AND WLastName = o.WLastName  -- ✅ Exact last names
+        ORDER BY CASE WHEN MarriageDate = o.MarriageDate THEN 0 ELSE 1 END
+    ) p
+    WHERE o.HLastName <> '' AND o.WLastName <> '';
+
+    -- Save matches (≥80%)
+    INSERT INTO online_marriagedocument_match(
+        MatchRegistryNum, Match_X_RegistryNum,
+        HFirstName, HMiddleName, HLastName, HBirthDate,
+        WFirstName, WMiddleName, WLastName, WBirthDate, MarriageDate,
+        GroomIdentityScore, BrideIdentityScore, MarriageDateScore, MatchPercent, DateMatched
+    )
+    SELECT
+        m.MatchRegistryNum, m.Match_X_RegistryNum,
+        UPPER(p.HFirstName), UPPER(p.HMiddleName), UPPER(p.HLastName), p.HBirthDate,
+        UPPER(p.WFirstName), UPPER(p.WMiddleName), UPPER(p.WLastName), p.WBirthDate, p.MarriageDate,
+        m.GroomNameScore, m.BrideNameScore, m.MarriageDateScore, m.MatchPercent, GETDATE()
+    FROM @Matches m
+    INNER JOIN LCRImaging_Marriage.dbo.Philcris_Marriage_All p WITH (NOLOCK) 
+        ON m.Match_X_RegistryNum = p.RegistryNum
+    WHERE m.MatchPercent >= 80.0;
+
+    SET @MatchesFound = @@ROWCOUNT;
+
+    -- ✅ TWO-STATE UPDATE: EXACT matches vs PENDING
+    UPDATE o
+    SET o.DuplicateCheck = 'Y', o.CheckStatus = CAST(ISNULL(m.MaxMatch,0) AS NVARCHAR(10))
+    FROM online_marriagedocument o
+    INNER JOIN (
+        SELECT MatchRegistryNum, MAX(MatchPercent) AS MaxMatch 
+        FROM @Matches 
+        WHERE MatchPercent >= 80.0 
+        GROUP BY MatchRegistryNum
+    ) m ON o.RegistryNum = m.MatchRegistryNum;
+
+    -- ✅ Mark non-matches as PENDING
+    UPDATE o
+    SET o.DuplicateCheck = 'PENDING', o.CheckStatus = '0'
+    FROM online_marriagedocument o
+    INNER JOIN @OnlineRecords r ON o.RegistryNum = r.RegistryNum
+    WHERE NOT EXISTS (
+        SELECT 1 FROM @Matches m 
+        WHERE m.MatchRegistryNum = r.RegistryNum 
+        AND m.MatchPercent >= 80.0
+    );
+
+    DECLARE @ElapsedSeconds DECIMAL(10,2) = DATEDIFF(MILLISECOND, @StartTime, GETDATE()) / 1000.0;
+
+    SELECT @ProcessedCount AS RecordsChecked, @MatchesFound AS MatchesFound,
+           @ElapsedSeconds AS ElapsedSeconds,
+           CASE WHEN @ElapsedSeconds > 0 THEN CAST(@ProcessedCount/@ElapsedSeconds AS DECIMAL(10,2)) ELSE 0.0 END AS RecordsPerSecond;
+END
+
+GO
+
+
+USE [LCRDbase_Online]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_CheckMarriageDuplicates_LEVENSHTEIN]    Script Date: 02/23/2026 4:15:01 pm ******/
+DROP PROCEDURE [dbo].[sp_CheckMarriageDuplicates_LEVENSHTEIN]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_CheckMarriageDuplicates_LEVENSHTEIN]    Script Date: 02/23/2026 4:15:01 pm ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+CREATE PROCEDURE [dbo].[sp_CheckMarriageDuplicates_LEVENSHTEIN]
+    @BatchSize INT = 100,
+    @MinSimilarity DECIMAL(5,2) = 80.0,
+    @Debug BIT = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+
+    DECLARE @StartTime DATETIME2 = GETDATE();
+    DECLARE @ProcessedCount INT = 0;
+    DECLARE @MatchesFound INT = 0;
+
+    DECLARE @OnlineRecords TABLE (
+        RegistryNum NVARCHAR(50) PRIMARY KEY,
+        HFirstName NVARCHAR(100), HMiddleName NVARCHAR(100), HLastName NVARCHAR(100), HBirthDate DATE,
+        WFirstName NVARCHAR(100), WMiddleName NVARCHAR(100), WLastName NVARCHAR(100), WBirthDate DATE,
+        MarriageDate DATE
+    );
+
+    -- ✅ ONLY PROCESS PENDING RECORDS
+    INSERT INTO @OnlineRecords
+    SELECT TOP (@BatchSize)
+        RegistryNum,
+        UPPER(LTRIM(RTRIM(ISNULL(HFirstName,'')))),
+        UPPER(LTRIM(RTRIM(ISNULL(HMiddleName,'')))),
+        UPPER(LTRIM(RTRIM(ISNULL(HLastName,'')))),
+        TRY_CONVERT(DATE, HBirthDate),
+        UPPER(LTRIM(RTRIM(ISNULL(WFirstName,'')))),
+        UPPER(LTRIM(RTRIM(ISNULL(WMiddleName,'')))),
+        UPPER(LTRIM(RTRIM(ISNULL(WLastName,'')))),
+        TRY_CONVERT(DATE, WBirthDate),
+        TRY_CONVERT(DATE, MarriageDate)
+    FROM online_marriagedocument
+    WHERE DuplicateCheck = 'PENDING'  -- ✅ Only PENDING
+      AND RegistryNum IS NOT NULL 
+      AND LTRIM(RTRIM(RegistryNum)) <> '';
+
+    SET @ProcessedCount = @@ROWCOUNT;
+
+    IF @ProcessedCount = 0
+    BEGIN
+        SELECT 0 AS RecordsChecked, 0 AS MatchesFound, 0.0 AS ElapsedSeconds, 0.0 AS RecordsPerSecond, @MinSimilarity AS MinThreshold;
+        RETURN;
+    END
+
+    DECLARE @Matches TABLE (
+        MatchRegistryNum NVARCHAR(50),
+        Match_X_RegistryNum NVARCHAR(50),
+        GroomNameSimilarity DECIMAL(5,2),
+        BrideNameSimilarity DECIMAL(5,2),
+        MarriageDateScore DECIMAL(5,2),
+        MatchPercent DECIMAL(5,2),
+        PRIMARY KEY (MatchRegistryNum, Match_X_RegistryNum)
+    );
+
+    -- Fuzzy matching (exact last names only for performance)
+    INSERT INTO @Matches
+    SELECT
+        o.RegistryNum,
+        p.RegistryNum,
+        dbo.fn_NameSimilarity(o.HFirstName,o.HMiddleName,o.HLastName,p.HFirstName,p.HMiddleName,p.HLastName) AS GroomNameSimilarity,
+        dbo.fn_NameSimilarity(o.WFirstName,o.WMiddleName,o.WLastName,p.WFirstName,p.WMiddleName,p.WLastName) AS BrideNameSimilarity,
+        CASE 
+            WHEN o.MarriageDate IS NOT NULL AND p.MarriageDate IS NOT NULL AND o.MarriageDate = p.MarriageDate THEN 100.0
+            WHEN o.MarriageDate IS NOT NULL AND p.MarriageDate IS NOT NULL AND ABS(DATEDIFF(DAY,o.MarriageDate,p.MarriageDate)) <= 3 THEN 80.0
+            WHEN o.MarriageDate IS NOT NULL AND p.MarriageDate IS NOT NULL AND ABS(DATEDIFF(DAY,o.MarriageDate,p.MarriageDate)) <= 7 THEN 60.0
+            ELSE 0.0
+        END AS MarriageDateScore,
+        (
+            dbo.fn_NameSimilarity(o.HFirstName,o.HMiddleName,o.HLastName,p.HFirstName,p.HMiddleName,p.HLastName) * 0.4
+            + dbo.fn_NameSimilarity(o.WFirstName,o.WMiddleName,o.WLastName,p.WFirstName,p.WMiddleName,p.WLastName) * 0.4
+            + CASE 
+                WHEN o.MarriageDate IS NOT NULL AND p.MarriageDate IS NOT NULL AND o.MarriageDate = p.MarriageDate THEN 100.0
+                WHEN o.MarriageDate IS NOT NULL AND p.MarriageDate IS NOT NULL AND ABS(DATEDIFF(DAY,o.MarriageDate,p.MarriageDate)) <= 3 THEN 80.0
+                WHEN o.MarriageDate IS NOT NULL AND p.MarriageDate IS NOT NULL AND ABS(DATEDIFF(DAY,o.MarriageDate,p.MarriageDate)) <= 7 THEN 60.0
+                ELSE 0.0
+              END * 0.2
+        ) AS MatchPercent
+    FROM @OnlineRecords o
+    CROSS APPLY (
+        SELECT TOP 100 * 
+        FROM LCRImaging_Marriage.dbo.Philcris_Marriage_All WITH (NOLOCK)
+        WHERE HLastName = o.HLastName AND WLastName = o.WLastName  -- ✅ Exact last names
+        ORDER BY CASE WHEN MarriageDate = o.MarriageDate THEN 0 ELSE 1 END
+    ) p
+    WHERE o.HLastName <> '' AND o.WLastName <> '';
+
+    -- Save fuzzy matches
+    INSERT INTO online_marriagedocument_match(
+        MatchRegistryNum, Match_X_RegistryNum,
+        HFirstName, HMiddleName, HLastName, HBirthDate,
+        WFirstName, WMiddleName, WLastName, WBirthDate, MarriageDate,
+        GroomIdentityScore, BrideIdentityScore, MarriageDateScore, MatchPercent, DateMatched
+    )
+    SELECT
+        m.MatchRegistryNum, m.Match_X_RegistryNum,
+        UPPER(p.HFirstName), UPPER(p.HMiddleName), UPPER(p.HLastName), p.HBirthDate,
+        UPPER(p.WFirstName), UPPER(p.WMiddleName), UPPER(p.WLastName), p.WBirthDate, p.MarriageDate,
+        m.GroomNameSimilarity, m.BrideNameSimilarity, m.MarriageDateScore, m.MatchPercent, GETDATE()
+    FROM @Matches m
+    INNER JOIN LCRImaging_Marriage.dbo.Philcris_Marriage_All p WITH (NOLOCK) 
+        ON m.Match_X_RegistryNum = p.RegistryNum
+    WHERE m.MatchPercent >= @MinSimilarity;
+
+    SET @MatchesFound = @@ROWCOUNT;
+
+    -- Update PENDING records with fuzzy results
+    UPDATE o
+    SET o.DuplicateCheck = 'Y', o.CheckStatus = CAST(ISNULL(m.MaxMatch,0) AS NVARCHAR(10))
+    FROM online_marriagedocument o
+    INNER JOIN (
+        SELECT MatchRegistryNum, MAX(MatchPercent) AS MaxMatch 
+        FROM @Matches 
+        GROUP BY MatchRegistryNum
+    ) m ON o.RegistryNum = m.MatchRegistryNum;
+
+    -- Mark remaining PENDING as checked (no fuzzy match)
+    UPDATE o
+    SET o.DuplicateCheck = 'Y', o.CheckStatus = '0'
+    FROM online_marriagedocument o
+    INNER JOIN @OnlineRecords r ON o.RegistryNum = r.RegistryNum
+    WHERE NOT EXISTS (SELECT 1 FROM @Matches m WHERE m.MatchRegistryNum = r.RegistryNum);
+
+    DECLARE @ElapsedSeconds DECIMAL(10,2) = DATEDIFF(MILLISECOND, @StartTime, GETDATE()) / 1000.0;
+
+    SELECT @ProcessedCount AS RecordsChecked, @MatchesFound AS MatchesFound,
+           @ElapsedSeconds AS ElapsedSeconds,
+           CASE WHEN @ElapsedSeconds > 0 THEN CAST(@ProcessedCount/@ElapsedSeconds AS DECIMAL(10,2)) ELSE 0.0 END AS RecordsPerSecond,
+           @MinSimilarity AS MinThreshold;
+END
+
+GO
+
+
+
+
+
