@@ -1,0 +1,382 @@
+/* ===================================================================
+   COMPACT RESPONSIVE VIEWER CSS FOR 15" MONITORS
+   Apply this to: birth_viewer.php, death_viewer.php, marriage_viewer.php
+   =================================================================== */
+
+/* Reset and Base */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    overflow-x: hidden;
+    font-size: 14px;
+}
+
+/* Compact Navbar */
+.navbar {
+    padding: 6px 12px !important;
+    min-height: 45px;
+}
+
+.navbar h4 {
+    font-size: 0.95rem !important;
+    margin: 0 !important;
+}
+
+.navbar .btn,
+.navbar .badge {
+    padding: 4px 10px !important;
+    font-size: 0.8rem !important;
+}
+
+/* Compact Page Header */
+.page-header {
+    padding: 10px 15px !important;
+    margin-bottom: 8px !important;
+}
+
+.page-header h2 {
+    font-size: 1.1rem !important;
+    margin: 0 !important;
+}
+
+.page-header small,
+.page-header p {
+    font-size: 0.75rem !important;
+    margin: 2px 0 0 0 !important;
+}
+
+/* Compact Container */
+.container-fluid {
+    padding: 8px 12px !important;
+    max-height: calc(100vh - 50px) !important;
+    overflow-y: auto !important;
+}
+
+/* Responsive Two-Column Layout */
+.viewer-layout {
+    display: grid;
+    grid-template-columns: 1fr 400px;
+    gap: 12px;
+    max-height: calc(100vh - 140px);
+}
+
+/* On smaller screens, stack vertically */
+@media (max-width: 1400px) {
+    .viewer-layout {
+        grid-template-columns: 1fr 350px;
+    }
+}
+
+@media (max-width: 1200px) {
+    .viewer-layout {
+        grid-template-columns: 1fr;
+        max-height: none;
+    }
+}
+
+/* Compact Info Sections */
+.info-section {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    padding: 10px 12px !important;
+    margin-bottom: 8px !important;
+}
+
+.info-section h3 {
+    font-size: 0.95rem !important;
+    padding: 6px 10px !important;
+    margin: -10px -12px 10px -12px !important;
+}
+
+/* Compact Info Rows */
+.info-row {
+    display: grid;
+    grid-template-columns: 140px 1fr;
+    gap: 10px;
+    padding: 6px 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    font-size: 0.85rem;
+}
+
+.info-row:last-child {
+    border-bottom: none;
+}
+
+.info-label {
+    font-weight: 600;
+    opacity: 0.7;
+    font-size: 0.8rem;
+}
+
+.info-value {
+    font-weight: 500;
+    word-break: break-word;
+}
+
+/* Compact Send Form */
+.send-form {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    padding: 12px;
+    position: sticky;
+    top: 0;
+    max-height: calc(100vh - 140px);
+    overflow-y: auto;
+}
+
+.send-form h3 {
+    font-size: 0.95rem !important;
+    padding: 6px 10px !important;
+    margin: -12px -12px 12px -12px !important;
+}
+
+/* Previous Send Details Box */
+.previous-send-box {
+    background: rgba(102, 126, 234, 0.1);
+    border: 1px solid rgba(102, 126, 234, 0.3);
+    border-radius: 6px;
+    padding: 10px;
+    margin-bottom: 12px;
+    font-size: 0.8rem;
+}
+
+.previous-send-box .send-detail {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.previous-send-box .send-detail:last-child {
+    border-bottom: none;
+}
+
+.previous-send-box .send-label {
+    opacity: 0.8;
+    font-size: 0.75rem;
+}
+
+.previous-send-box .send-value {
+    font-weight: 600;
+    font-size: 0.8rem;
+}
+
+/* Compact Form Groups */
+.form-group {
+    margin-bottom: 10px !important;
+}
+
+.form-group label {
+    font-size: 0.8rem !important;
+    font-weight: 600 !important;
+    margin-bottom: 4px !important;
+}
+
+.form-control,
+.form-select {
+    padding: 6px 10px !important;
+    font-size: 0.85rem !important;
+    height: auto !important;
+}
+
+textarea.form-control {
+    min-height: 60px !important;
+    resize: vertical;
+}
+
+/* Compact Buttons */
+.btn {
+    padding: 8px 16px !important;
+    font-size: 0.85rem !important;
+}
+
+.btn-lg {
+    padding: 10px 20px !important;
+    font-size: 0.9rem !important;
+}
+
+/* Send Button - Always Visible */
+.btn-send-record {
+    width: 100%;
+    padding: 10px !important;
+    font-size: 0.9rem !important;
+    font-weight: 700 !important;
+}
+
+/* Compact Badges */
+.badge {
+    padding: 4px 8px !important;
+    font-size: 0.75rem !important;
+}
+
+/* Left Panel Scrollable */
+.left-panel {
+    overflow-y: auto;
+    max-height: calc(100vh - 140px);
+    padding-right: 8px;
+}
+
+/* Custom Scrollbar */
+.left-panel::-webkit-scrollbar,
+.send-form::-webkit-scrollbar {
+    width: 6px;
+}
+
+.left-panel::-webkit-scrollbar-track,
+.send-form::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 3px;
+}
+
+.left-panel::-webkit-scrollbar-thumb,
+.send-form::-webkit-scrollbar-thumb {
+    background: rgba(102, 126, 234, 0.5);
+    border-radius: 3px;
+}
+
+.left-panel::-webkit-scrollbar-thumb:hover,
+.send-form::-webkit-scrollbar-thumb:hover {
+    background: rgba(102, 126, 234, 0.7);
+}
+
+/* File Upload Compact */
+.file-upload-wrapper {
+    margin-bottom: 10px;
+}
+
+.file-upload-wrapper input[type="file"] {
+    font-size: 0.8rem !important;
+}
+
+.file-upload-wrapper small {
+    font-size: 0.7rem !important;
+}
+
+/* Responsive Adjustments */
+@media (max-width: 1400px) {
+    .info-row {
+        grid-template-columns: 120px 1fr;
+        font-size: 0.8rem;
+    }
+    
+    .info-label {
+        font-size: 0.75rem;
+    }
+}
+
+@media (max-width: 1200px) {
+    .left-panel {
+        max-height: none;
+        overflow-y: visible;
+    }
+    
+    .send-form {
+        position: relative;
+        max-height: none;
+    }
+    
+    .viewer-layout {
+        gap: 15px;
+    }
+}
+
+/* Loading Overlay Compact */
+.loading-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.8);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 9999;
+}
+
+.loading-content {
+    text-align: center;
+    padding: 20px;
+}
+
+.loading-content .spinner-border {
+    width: 3rem;
+    height: 3rem;
+}
+
+/* Status Badge Compact */
+.status-badge {
+    padding: 5px 12px !important;
+    font-size: 0.8rem !important;
+    border-radius: 20px;
+}
+
+/* Tip Box Compact */
+.tip-box {
+    background: rgba(255, 193, 7, 0.1);
+    border: 1px solid rgba(255, 193, 7, 0.3);
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-bottom: 10px;
+    font-size: 0.75rem;
+}
+
+/* Print Styles */
+@media print {
+    .navbar,
+    .send-form,
+    .btn,
+    .loading-overlay {
+        display: none !important;
+    }
+    
+    .viewer-layout {
+        grid-template-columns: 1fr;
+    }
+    
+    .info-section {
+        page-break-inside: avoid;
+    }
+}
+
+/* Focus States */
+.form-control:focus,
+.form-select:focus {
+    border-color: rgba(102, 126, 234, 0.8);
+    box-shadow: 0 0 0 0.2rem rgba(102, 126, 234, 0.25);
+}
+
+/* Hover Effects */
+.btn:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+}
+
+/* Mobile Responsive (for very small screens) */
+@media (max-width: 768px) {
+    .navbar h4 {
+        font-size: 0.85rem !important;
+    }
+    
+    .info-row {
+        grid-template-columns: 1fr;
+        gap: 4px;
+    }
+    
+    .info-label {
+        font-weight: 700;
+        opacity: 0.9;
+    }
+    
+    .form-control,
+    .form-select,
+    .btn {
+        font-size: 0.9rem !important;
+    }
+}
